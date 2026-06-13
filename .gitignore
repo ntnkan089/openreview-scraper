@@ -3,8 +3,13 @@ __pycache__/
 *.pyc
 
 # transient checkpoint files (cleared after a clean run)
-out/*_papers_partial.jsonl
+out/*_partial.jsonl
 out/*_checkpoint.json
+
+# regenerated local outputs — re-create with scraper.py / author_scraper.py
+out/_scrape_*.log
+out/*.parquet
+out/*_papers.csv
 
 # personal working drafts, not for the public repo
 email_draft.md

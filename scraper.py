@@ -137,6 +137,8 @@ class PaperRow:
     meta_reviewer_handle: str
     reviews: list[ReviewRow] = field(default_factory=list)
     general_response: str = ""     # author comments aimed at all reviewers, not one review
+    bucket: str = ""               # decision label of the bucket this paper was fetched from
+                                   # (drives which per-bucket CSV it is written to)
 
 
 # ---------- helpers ----------
@@ -461,19 +463,43 @@ def paper_to_dict(paper: PaperRow, max_reviews: int,
     return row
 
 
-def write_papers_csv(papers: list[PaperRow], rating_fields: list[str],
-                     out_path: Path) -> None:
-    if not papers:
-        print(f"No papers to write to {out_path}")
-        return
-    max_reviews = max((len(p.reviews) for p in papers), default=0)
-    rows = [paper_to_dict(p, max_reviews, rating_fields) for p in papers]
+def _write_csv_rows(rows: list[dict], out_path: Path) -> None:
     fieldnames = list(rows[0].keys())
     with out_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
-    print(f"Wrote {len(rows)} papers -> {out_path}  (max reviews per paper: {max_reviews})")
+
+
+def _write_parquet_rows(rows: list[dict], out_path: Path) -> None:
+    """Write rows to Parquet (zstd). Every column is stored as text so the
+    Parquet is a lossless mirror of the CSV ('' for empties) — same information,
+    ~half the size, and no 32k-char-cell / embedded-newline issues."""
+    import pandas as pd
+    df = pd.DataFrame([{k: ("" if v is None else str(v)) for k, v in r.items()}
+                       for r in rows])
+    df.to_parquet(out_path, engine="pyarrow", compression="zstd", index=False)
+
+
+def write_papers(papers: list[PaperRow], rating_fields: list[str],
+                 out_dir: Path, base_name: str, fmt: str = "csv") -> None:
+    """Write one bucket's papers as CSV and/or Parquet (fmt: csv|parquet|both)."""
+    if not papers:
+        print(f"No papers to write for {base_name}")
+        return
+    max_reviews = max((len(p.reviews) for p in papers), default=0)
+    rows = [paper_to_dict(p, max_reviews, rating_fields) for p in papers]
+    written = []
+    if fmt in ("csv", "both"):
+        p = out_dir / f"{base_name}.csv"
+        _write_csv_rows(rows, p)
+        written.append(p)
+    if fmt in ("parquet", "both"):
+        p = out_dir / f"{base_name}.parquet"
+        _write_parquet_rows(rows, p)
+        written.append(p)
+    names = ", ".join(x.name for x in written)
+    print(f"Wrote {len(rows)} papers -> {names}  (max reviews per paper: {max_reviews})")
 
 
 # ---------- venue config ----------
@@ -560,6 +586,7 @@ def paper_to_json(p: PaperRow) -> dict:
         "meta_review_text": p.meta_review_text,
         "meta_reviewer_handle": p.meta_reviewer_handle,
         "general_response": p.general_response,
+        "bucket": p.bucket,
         "reviews": [
             {
                 "reviewer_handle": r.reviewer_handle,
@@ -591,6 +618,7 @@ def paper_from_json(d: dict) -> PaperRow:
         meta_reviewer_handle=d.get("meta_reviewer_handle", ""),
         reviews=reviews,
         general_response=d.get("general_response", ""),
+        bucket=d.get("bucket", ""),
     )
 
 
@@ -627,10 +655,21 @@ def slug(venue_id: str) -> str:
     return venue_id.replace(".cc/", "_").replace("/", "_")
 
 
+def bucket_slug(decision_label: str) -> str:
+    """Turn a decision label into a filename-safe token.
+
+    'Accept (Oral)' -> 'Accept_Oral'; 'Accept (spotlight poster)' ->
+    'Accept_spotlight_poster'; 'Reject' -> 'Reject'.
+    """
+    s = re.sub(r"[^0-9A-Za-z]+", "_", decision_label).strip("_")
+    return s or "Unknown"
+
+
 def run(venue_id: str, limit_per_bucket: int, out_dir: Path,
         rating_fields_override: list[str] | None = None,
         checkpoint_every: int = 100,
-        restart: bool = False) -> list[PaperRow]:
+        restart: bool = False,
+        fmt: str = "csv") -> list[PaperRow]:
     client = OpenReviewClient(baseurl="https://api2.openreview.net")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -722,6 +761,7 @@ def run(venue_id: str, limit_per_bucket: int, out_dir: Path,
                 if is_reject and not paper.reviews:
                     print("    (skip: no reviews)")
                     continue
+                paper.bucket = decision        # which per-bucket CSV this paper lands in
                 all_papers.append(paper)
                 pending_flush.append(paper)
                 completed_ids.add(sub.forum)
@@ -740,8 +780,16 @@ def run(venue_id: str, limit_per_bucket: int, out_dir: Path,
         do_flush("error")
         raise
 
-    csv_path = out_dir / f"{slug(venue_id)}_papers.csv"
-    write_papers_csv(all_papers, rating_fields, csv_path)
+    # One CSV per decision bucket so no single file gets unwieldy on a full
+    # conference (the reject bucket alone can be thousands of papers). Each
+    # file computes its own review-column width independently.
+    groups: dict[str, list[PaperRow]] = {}
+    for p in all_papers:
+        groups.setdefault(p.bucket or p.type, []).append(p)
+    base = slug(venue_id)
+    for bucket_label, papers in groups.items():
+        base_name = f"{base}_{bucket_slug(bucket_label)}_papers"
+        write_papers(papers, rating_fields, out_dir, base_name, fmt)
 
     # dump author-id list for the author scraper to consume
     author_ids = sorted({aid for p in all_papers for aid in p.author_ids})
@@ -774,9 +822,14 @@ def main():
     ap.add_argument("--restart", action="store_true",
                     help="Ignore (and delete) any existing checkpoint for this "
                          "venue and start fresh.")
+    ap.add_argument("--format", choices=["csv", "parquet", "both"], default="csv",
+                    help="Output file format. 'parquet' is ~half the size and "
+                         "lossless (columns stored as text); 'both' writes each "
+                         "per-bucket file as .csv and .parquet. Default csv.")
     args = ap.parse_args()
     run(args.venue, args.limit, Path(args.out), args.rating_fields,
-        checkpoint_every=args.checkpoint_every, restart=args.restart)
+        checkpoint_every=args.checkpoint_every, restart=args.restart,
+        fmt=args.format)
 
 
 if __name__ == "__main__":

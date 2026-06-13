@@ -27,18 +27,33 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-# 1. papers CSV + author-id manifest (out/{venue}_papers.csv, _author_ids.json)
+# 1. one papers file PER decision bucket + author-id manifest
+#    (out/{venue}_{bucket}_papers.csv, out/{venue}_author_ids.json)
 python scraper.py --venue ICLR.cc/2026/Conference --limit 7
 
 # 2. authors CSV (consumes the manifest from step 1)
 python author_scraper.py --venue ICLR.cc/2026/Conference
 
-# Optional: human-readable preview of both CSVs into PREVIEW.md
+# Optional: human-readable preview of the CSVs into PREVIEW.md
 python preview.py
 ```
 
 `--limit N` is **per decision bucket**, so on ICLR (3 buckets) `--limit 7`
 gives ~21 papers. On ICML 2025 (4 buckets) `--limit 5` gives ~20.
+
+**Output is split one file per bucket** (e.g.
+`ICLR_2026_Conference_Accept_Oral_papers.csv`,
+`..._Accept_Poster_papers.csv`, `..._Reject_papers.csv`) so no single file
+gets unwieldy on a full conference.
+
+**File format.** Both scrapers take `--format csv|parquet|both` (default
+`csv`). Parquet is ~half the size, lossless (columns stored as text), and
+immune to Excel's 32k-char-per-cell / embedded-newline issues — but it's
+binary, so read it with pandas / DuckDB / `preview.py`, not a text editor.
+```bash
+python scraper.py        --venue ICLR.cc/2026/Conference --limit 7 --format both
+python author_scraper.py --venue ICLR.cc/2026/Conference --format parquet
+```
 
 Try ICML with the same scraper, no code changes:
 ```bash
@@ -48,15 +63,34 @@ python author_scraper.py --venue ICML.cc/2025/Conference
 
 ## Long runs / crash recovery
 
-Scraping a full conference (10k+ papers) takes hours. The scraper checkpoints
-to disk every 100 papers (configurable via `--checkpoint-every N`). If it
-crashes, you `Ctrl+C` it, or your CSV is locked by Excel, **re-run the same
-command** and it picks up from the last checkpoint. Use `--restart` to
-discard the checkpoint and start fresh.
+Scraping a full conference (10k+ papers) takes hours. **Both** scrapers
+checkpoint to disk every 100 items (configurable via `--checkpoint-every N`):
+`scraper.py` flushes papers, and `author_scraper.py` flushes profiles (the
+author stage is the slow, rate-limited one — OpenReview throttles
+unauthenticated profile lookups to ~20/min). If a run crashes, you `Ctrl+C`
+it, or your CSV is locked by Excel, **re-run the same command** and it picks
+up from the last checkpoint. Use `--restart` to discard the checkpoint and
+start fresh.
+
+For long runs, prefer `--format parquet` (or `both`) — it roughly halves the
+on-disk size of the output and avoids the per-cell limits that break large
+review/rebuttal text in Excel.
+
+Full-conference run, copy-paste (every paper in every bucket, checkpointed,
+Parquet output). On Windows PowerShell use `.\.venv\Scripts\python.exe`; in
+git bash / macOS / Linux use `.venv/Scripts/python.exe` (or just `python`
+inside an activated venv):
+```bash
+python scraper.py        --venue ICLR.cc/2026/Conference --limit 100000 --format parquet --checkpoint-every 100
+python author_scraper.py --venue ICLR.cc/2026/Conference --format parquet --checkpoint-every 100
+```
+If a run dies, re-run the **same** line to resume from the last checkpoint.
+`--checkpoint-every 100` flushes progress every 100 items (the default — lower
+it, e.g. `--checkpoint-every 25`, to checkpoint more often on a flaky network).
 
 ## Output columns
 
-**`{venue}_papers.csv`** — one row per paper:
+**`{venue}_{bucket}_papers.csv`** (one file per decision bucket) — one row per paper:
 
 `link, title, authors, keywords, abstract, primary_area,
 submission_number, type, Meta Review, Meta Reviewer, General Response,

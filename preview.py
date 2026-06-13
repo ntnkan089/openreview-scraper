@@ -14,6 +14,24 @@ def load(name):
         return list(csv.DictReader(f))
 
 
+def load_papers(venue_prefix):
+    """Load all per-bucket papers CSVs for a venue and concatenate them.
+
+    scraper.py now writes one file per decision bucket
+    ({prefix}_Accept_Oral_papers.csv, {prefix}_Reject_papers.csv, ...). Fall
+    back to the old single {prefix}_papers.csv if no per-bucket files exist.
+    Returns (rows, [filenames])."""
+    files = sorted(OUT.glob(f"{venue_prefix}_*_papers.csv"))
+    if not files:
+        legacy = OUT / f"{venue_prefix}_papers.csv"
+        files = [legacy] if legacy.exists() else []
+    rows = []
+    for fp in files:
+        with fp.open(encoding="utf-8") as f:
+            rows.extend(csv.DictReader(f))
+    return rows, [fp.name for fp in files]
+
+
 def fmt_block(text, max_chars=600):
     if not text:
         return "_(empty)_"
@@ -112,9 +130,9 @@ def render_author(row, label):
 
 
 def main():
-    iclr_papers = load("ICLR_2026_Conference_papers.csv")
+    iclr_papers, iclr_files = load_papers("ICLR_2026_Conference")
     iclr_authors = load("ICLR_2026_Conference_authors.csv")
-    icml_papers = load("ICML_2025_Conference_papers.csv")
+    icml_papers, icml_files = load_papers("ICML_2025_Conference")
 
     sections = []
     sections.append(
@@ -124,13 +142,14 @@ def main():
         "paper (to demonstrate cross-venue adaptivity) and a sample author profile."
     )
 
-    sections.append(f"**Files generated:**\n\n"
-                    f"- `out/ICLR_2026_Conference_papers.csv` — {len(iclr_papers)} rows, "
-                    f"{len(iclr_papers[0])} cols\n"
-                    f"- `out/ICLR_2026_Conference_authors.csv` — {len(iclr_authors)} rows, "
-                    f"{len(iclr_authors[0])} cols\n"
-                    f"- `out/ICML_2025_Conference_papers.csv` — {len(icml_papers)} rows, "
-                    f"{len(icml_papers[0])} cols")
+    file_lines = [f"- `out/{n}`" for n in iclr_files + ["ICLR_2026_Conference_authors.csv"] + icml_files]
+    sections.append("**Files generated:**\n\n"
+                    f"- ICLR 2026 papers: {len(iclr_papers)} rows across "
+                    f"{len(iclr_files)} per-bucket file(s)\n"
+                    f"- ICLR 2026 authors: {len(iclr_authors)} rows\n"
+                    f"- ICML 2025 papers: {len(icml_papers)} rows across "
+                    f"{len(icml_files)} per-bucket file(s)\n\n"
+                    + "\n".join(file_lines))
 
     sections.append("---\n# ICLR 2026 — Output I (papers)")
 
