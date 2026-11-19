@@ -13,3 +13,7 @@ out/*_papers.csv
 
 # personal working drafts, not for the public repo
 email_draft.md
+
+# Timestamped research datasets remain local
+out/snapshots/
+out/sharing/
