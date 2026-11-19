@@ -122,6 +122,14 @@ written and validated before this final API check. A resume validates and
 reuses existing compatible exports, then retries the membership check.
 Repeat any non-default --page-size or --limit used for the original run.
 
+Resume reads and validates completed raw pages before requesting the first
+missing page. The console reports `Reused ... saved papers` for this work;
+it does not download those papers again or rewrite an earlier progress count
+for every cached page. The raw pages remain the source of saved progress even
+if the manifest update was interrupted. Windows checkpoint writes use unique
+temporary files and retry temporary access-denied errors. Ctrl+C retains saved
+pages and prints a resume hint.
+
 ## Offline code check
 
 ```powershell

@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from active_snapshot import API, AccessBlocked, capture, main, review_row, score, public_response
+from active_snapshot import API, AccessBlocked, atomic_json, capture, main, review_row, score, public_response
 
 VENUE = "ICLR.cc/2027/Conference"
 ACTIVE = VENUE + "/Submission"
@@ -239,6 +239,99 @@ class SnapshotTests(unittest.TestCase):
         manifest = json.loads((folder / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "blocked")
         self.assertFalse((folder / "compatible").exists())
+
+    def test_resume_does_not_rewrite_lower_progress_for_cached_pages(self):
+        papers = [paper("a", 1), paper("b", 2), paper("c", 3)]
+        with self.assertRaises(AccessBlocked):
+            capture(FakeAPI(papers, fail_offset=2), VENUE, self.out, page_size=1)
+        folder = next(self.out.iterdir())
+        progress = []
+
+        def save(path, data):
+            if path.name == "manifest.json":
+                progress.append(data.get("captured_submission_rows"))
+            atomic_json(path, data)
+
+        api = FakeAPI(papers)
+        output = io.StringIO()
+        with patch("active_snapshot.atomic_json", side_effect=save), redirect_stdout(output):
+            capture(api, VENUE, self.out, page_size=1, resume=folder)
+        downloads = [params["offset"] for endpoint, params in api.calls
+                     if endpoint == "/notes" and params.get("details")]
+        self.assertEqual(downloads, [2])
+        self.assertNotIn(1, progress)
+        self.assertIn("Reused 2 saved papers", output.getvalue())
+        self.assertNotIn("Captured 1/", output.getvalue())
+        self.assertNotIn("Captured 2/", output.getvalue())
+
+    def test_manifest_error_does_not_hide_original_download_failure(self):
+        class BrokenAPI(FakeAPI):
+            def get(self, endpoint, params):
+                if endpoint == "/notes":
+                    raise RuntimeError("original download failure")
+                return super().get(endpoint, params)
+
+        def save(path, data):
+            if data.get("status") == "interrupted":
+                raise PermissionError("manifest locked")
+            atomic_json(path, data)
+
+        with patch("active_snapshot.atomic_json", side_effect=save), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "original download failure"):
+                capture(BrokenAPI([paper("a", 1)]), VENUE, self.out)
+
+    def test_keyboard_interrupt_exits_cleanly_with_resume_hint(self):
+        error = io.StringIO()
+        with patch("sys.argv", ["active_snapshot.py"]), \
+                patch("active_snapshot.capture", side_effect=KeyboardInterrupt), \
+                patch("sys.stderr", error):
+            self.assertEqual(main(), 130)
+        self.assertIn("--resume", error.getvalue())
+        self.assertNotIn("Traceback", error.getvalue())
+
+
+class AtomicCheckpointTests(unittest.TestCase):
+    def test_retries_temporary_windows_file_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "manifest.json"
+            path.write_text('{"old": true}', encoding="utf-8")
+            original_replace = Path.replace
+            attempts = []
+
+            def replace(temp, destination):
+                attempts.append(temp)
+                if len(attempts) < 3:
+                    raise PermissionError("WinError 5: Access is denied")
+                return original_replace(temp, destination)
+
+            with patch.object(Path, "replace", replace), patch("active_snapshot.time.sleep") as sleep:
+                atomic_json(path, {"captured_submission_rows": 2300})
+            self.assertEqual(json.loads(path.read_text()), {"captured_submission_rows": 2300})
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(list(Path(folder).iterdir()), [path])
+
+    def test_permanent_lock_preserves_last_checkpoint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "manifest.json"
+            previous = '{"captured_submission_rows": 2300}'
+            path.write_text(previous, encoding="utf-8")
+            with patch.object(Path, "replace", side_effect=PermissionError("locked")) as replace, \
+                    patch("active_snapshot.time.sleep"):
+                with self.assertRaises(PermissionError):
+                    atomic_json(path, {"captured_submission_rows": 2400})
+            self.assertEqual(replace.call_count, 8)
+            self.assertEqual(path.read_text(), previous)
+            self.assertEqual(list(Path(folder).iterdir()), [path])
+
+    def test_stale_fixed_temp_file_is_not_reused_or_overwritten(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "manifest.json"
+            stale = path.with_suffix(".json.tmp")
+            stale.write_text("left by an earlier interrupted process", encoding="utf-8")
+            atomic_json(path, {"captured_submission_rows": 2300})
+            self.assertEqual(json.loads(path.read_text()), {"captured_submission_rows": 2300})
+            self.assertEqual(stale.read_text(), "left by an earlier interrupted process")
 
 
 if __name__ == "__main__":

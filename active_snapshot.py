@@ -12,6 +12,7 @@ import csv
 import json
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,9 +32,32 @@ def value(content, key, default=""):
 
 
 def atomic_json(path, data):
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    path = Path(path)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    temp = None
+    try:
+        # Close the temporary file before replacing the destination on Windows.
+        # Unique names also prevent a leftover .tmp file from blocking a resume.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix="." + path.name + ".", suffix=".tmp",
+                                         delete=False) as stream:
+            temp = Path(stream.name)
+            stream.write(payload)
+        for attempt in range(8):
+            try:
+                temp.replace(path)
+                return
+            except PermissionError:
+                # Windows scanners/readers can temporarily prevent replacement.
+                if attempt == 7:
+                    raise
+                time.sleep(min(0.1 * 2 ** attempt, 1.0))
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class AccessBlocked(RuntimeError):
@@ -322,6 +346,7 @@ def capture(api, venue, out, page_size=100, limit=None, resume=None, compatible=
                          "review_name": value(content, "review_name", "Official_Review")})
         atomic_json(folder / "manifest.json", manifest)
         offset = 0
+        reused_pages = 0
         # Keep completed raw pages; retry only the unfinished page on resume.
         while True:
             page_path = folder / "pages" / f"{offset:09d}.json"
@@ -329,9 +354,15 @@ def capture(api, venue, out, page_size=100, limit=None, resume=None, compatible=
             if size <= 0:
                 break
             params = {**manifest["query"], "limit": size, "offset": offset, "sort": "number:asc", "details": "replies"}
-            if page_path.exists():
+            cached = page_path.exists()
+            if cached:
                 envelope = json.loads(page_path.read_text(encoding="utf-8"))
+                reused_pages += 1
             else:
+                if reused_pages:
+                    print(f"Reused {offset} saved papers ({reused_pages} pages); "
+                          f"downloading from offset {offset}.", flush=True)
+                    reused_pages = 0
                 data = api.get("/notes", params)
                 if not isinstance(data.get("notes"), list) or not isinstance(data.get("count"), int):
                     raise RuntimeError("API response missing notes/count")
@@ -343,12 +374,15 @@ def capture(api, venue, out, page_size=100, limit=None, resume=None, compatible=
                 manifest["api_count_at_start"] = data["count"]
             offset += len(notes)
             manifest.update({"captured_submission_rows": offset, "last_page_at_utc": envelope["captured_at_utc"]})
-            atomic_json(folder / "manifest.json", manifest)
-            print(f"Captured {offset}/{data['count']} papers with public replies", flush=True)
+            if not cached:
+                atomic_json(folder / "manifest.json", manifest)
+                print(f"Captured {offset}/{data['count']} papers with public replies", flush=True)
             if offset >= data["count"] or (limit and offset >= limit):
                 break
             if not notes:
                 raise RuntimeError("Empty page before reported total")
+        if reused_pages:
+            print(f"Reused {offset} saved papers; saved-page download is complete.", flush=True)
         manifest["phase"] = "exporting"
         atomic_json(folder / "manifest.json", manifest)
         papers, reviews = export_snapshot(folder, manifest)
@@ -386,7 +420,11 @@ def capture(api, venue, out, page_size=100, limit=None, resume=None, compatible=
         manifest.update({"status": ("exported_verification_pending" if manifest.get("phase") == "verifying_membership"
                                     else "blocked" if isinstance(exc, AccessBlocked) else "interrupted"),
                          "last_error": str(exc), "last_error_at_utc": utcnow(), "coverage_verified": False})
-        atomic_json(folder / "manifest.json", manifest)
+        try:
+            atomic_json(folder / "manifest.json", manifest)
+        except OSError as checkpoint_error:
+            print(f"Could not update manifest; saved pages remain in {folder}: "
+                  f"{checkpoint_error}", file=sys.stderr, flush=True)
         raise
 
 
@@ -421,6 +459,10 @@ def main():
             del password, client
         _, manifest = capture(API(args.delay, token=token), args.venue, args.out,
                               args.page_size, args.limit, args.resume, compatible=args.compatible)
+    except KeyboardInterrupt:
+        print("\nStopped. Saved pages are retained; use --resume with the same snapshot folder.",
+              file=sys.stderr, flush=True)
+        return 130
     except Exception as exc:
         print(str(exc), file=sys.stderr, flush=True)
         return 1
